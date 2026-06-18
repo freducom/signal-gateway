@@ -176,6 +176,24 @@ services:
 
 `myapp`'s `/cmd` endpoint receives requests shaped like `POST {"message": "<text after the prefix>"}` and may return any text body — whatever it returns is sent back to you over Signal.
 
+If `myapp` is on a different docker network (reached via `host.docker.internal`), anyone on the host can hit `/cmd` and spoof commands. Add an `auth_header` to the registration so signal-gateway includes a shared secret on every call:
+
+```yaml
+    command: >
+      sh -c 'until curl -sf
+              -H "X-Token: $$ROUTER_TOKEN"
+              -H "Content-Type: application/json"
+              -d "{
+                \"prefix\":\"myapp\",
+                \"webhook\":\"http://host.docker.internal:1234/cmd\",
+                \"auth_header\":{\"name\":\"X-Webhook-Token\",\"value\":\"$$WEBHOOK_TOKEN\"}
+              }"
+              http://host.docker.internal:8091/register;
+            do sleep 5; done'
+```
+
+`myapp` should then reject any `/cmd` request whose `X-Webhook-Token` header doesn't match.
+
 ## API reference
 
 ### notify — `127.0.0.1:8090`
@@ -187,12 +205,14 @@ services:
 
 ### router — `127.0.0.1:8091`
 
-| Method | Path                | Auth                     | Body                                  |
-|--------|---------------------|--------------------------|---------------------------------------|
-| POST   | /register           | `X-Token: $ROUTER_TOKEN` | `{"prefix": "...", "webhook": "..."}` |
-| DELETE | /register/{prefix}  | `X-Token: $ROUTER_TOKEN` | —                                     |
-| GET    | /routes             | `X-Token: $ROUTER_TOKEN` | — (returns current registrations)     |
-| GET    | /health             | —                        | —                                     |
+| Method | Path                | Auth                     | Body                                                                                              |
+|--------|---------------------|--------------------------|---------------------------------------------------------------------------------------------------|
+| POST   | /register           | `X-Token: $ROUTER_TOKEN` | `{"prefix": "...", "webhook": "...", "auth_header": {"name": "...", "value": "..."}}` (auth optional) |
+| DELETE | /register/{prefix}  | `X-Token: $ROUTER_TOKEN` | —                                                                                                 |
+| GET    | /routes             | `X-Token: $ROUTER_TOKEN` | — (returns current registrations; `has_auth_header` only, never the secret)                       |
+| GET    | /health             | —                        | —                                                                                                 |
+
+If `auth_header` is supplied in `/register`, the router sends that header on every webhook POST. Use it whenever the target webhook is reachable by other containers on the host (anything with `host.docker.internal` access) and you want the receiving app to verify the call came from signal-gateway.
 
 ### signal-api — `127.0.0.1:8080`
 

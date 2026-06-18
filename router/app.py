@@ -18,7 +18,8 @@ ROUTES_PATH = Path("/data/routes.json")
 ROUTES_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 routes_lock = threading.Lock()
-routes: dict[str, str] = {}
+# Each route: {"webhook": str, "auth_header": {"name": str, "value": str} | None}
+routes: dict[str, dict] = {}
 own_device_id: int | None = None
 
 app = Flask(__name__)
@@ -29,7 +30,12 @@ def load_routes():
     if ROUTES_PATH.exists():
         try:
             with ROUTES_PATH.open() as f:
-                routes = json.load(f)
+                raw = json.load(f)
+            # Back-compat: older routes.json stored bare URL strings.
+            routes = {
+                k: ({"webhook": v, "auth_header": None} if isinstance(v, str) else v)
+                for k, v in raw.items()
+            }
         except json.JSONDecodeError:
             routes = {}
     else:
@@ -60,12 +66,20 @@ def register():
     body = request.get_json(force=True, silent=True) or {}
     prefix = (body.get("prefix") or "").strip().lower()
     webhook = (body.get("webhook") or "").strip()
+    auth_header = body.get("auth_header")
     if not prefix or not webhook:
         abort(400, "prefix and webhook required")
+    if auth_header is not None:
+        if (
+            not isinstance(auth_header, dict)
+            or not auth_header.get("name")
+            or not auth_header.get("value")
+        ):
+            abort(400, "auth_header must be an object with 'name' and 'value'")
     with routes_lock:
-        routes[prefix] = webhook
+        routes[prefix] = {"webhook": webhook, "auth_header": auth_header}
         save_routes()
-    return jsonify(ok=True, prefix=prefix, webhook=webhook)
+    return jsonify(ok=True, prefix=prefix, webhook=webhook, auth_header=bool(auth_header))
 
 
 @app.delete("/register/<prefix>")
@@ -81,7 +95,13 @@ def unregister(prefix):
 def list_routes():
     auth_or_abort()
     with routes_lock:
-        return jsonify(dict(routes))
+        return jsonify({
+            prefix: {
+                "webhook": route["webhook"],
+                "has_auth_header": route.get("auth_header") is not None,
+            }
+            for prefix, route in routes.items()
+        })
 
 
 def discovery_loop():
@@ -146,14 +166,19 @@ def handle_envelope(raw: dict):
     body = parts[1] if len(parts) > 1 else ""
 
     with routes_lock:
-        webhook = routes.get(prefix)
+        route = routes.get(prefix)
 
-    if not webhook:
+    if not route:
         send_reply(f"no handler for prefix '{prefix}'")
         return
 
+    headers = {}
+    auth_header = route.get("auth_header")
+    if auth_header:
+        headers[auth_header["name"]] = auth_header["value"]
+
     try:
-        r = requests.post(webhook, json={"message": body}, timeout=30)
+        r = requests.post(route["webhook"], json={"message": body}, headers=headers, timeout=30)
         reply = r.text.strip() or f"({r.status_code} no body)"
     except requests.RequestException as e:
         reply = f"webhook error: {e}"
