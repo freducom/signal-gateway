@@ -51,7 +51,7 @@ services:
       - NOTIFY_TOKEN=${NOTIFY_TOKEN}
     ports:
       - "127.0.0.1:8090:8090"
-    networks: [ internal ]
+    networks: [ internal, signal ]
 
   router:
     image: ghcr.io/freducom/signal-gateway-router:latest
@@ -68,10 +68,16 @@ services:
       - "127.0.0.1:8091:8091"
     volumes:
       - ./data/router:/data
-    networks: [ internal ]
+    networks: [ internal, signal ]
 
 networks:
   internal:
+    driver: bridge
+  # Shared bridge other compose projects join as external. They reach the
+  # gateway by service hostname (signal-gateway-notify:8090 etc.) — no host
+  # port hopping, no host.docker.internal needed.
+  signal:
+    name: signal
     driver: bridge
 ```
 
@@ -126,16 +132,24 @@ Done. Wire up other compose projects below.
 
 ## Using from another compose project
 
+Other projects join the shared `signal` bridge network (created by signal-gateway) as external. Inside that network, the gateway is reachable at the hostnames `signal-gateway-notify` (port 8090) and `signal-gateway-router` (port 8091).
+
+> **Linux note.** The `signal` network is the canonical way to integrate. Reaching the gateway via the host's `127.0.0.1` binds from another container will silently fail on Linux because signal-gateway only listens on the host loopback — the host port binds are for browser-based QR linking and host-side `curl`, not for cross-container traffic.
+
 ### Just sending notifications
 
 ```yaml
 services:
   myapp:
     # ...your existing config...
-    extra_hosts:
-      - host.docker.internal:host-gateway
+    networks: [ default, signal ]
     environment:
       - NOTIFY_TOKEN=<same value as signal-gateway/.env>
+
+networks:
+  default:
+  signal:
+    external: true
 ```
 
 Inside `myapp`:
@@ -143,7 +157,7 @@ Inside `myapp`:
 ```bash
 curl -H "X-Token: $NOTIFY_TOKEN" \
      --data "build done on $(hostname)" \
-     http://host.docker.internal:8090/notify
+     http://signal-gateway-notify:8090/notify
 ```
 
 ### Send + receive (register a command prefix)
@@ -154,15 +168,13 @@ Add a one-shot sidecar that registers your command prefix on startup. Replace `m
 services:
   myapp:
     # ...your existing config...
-    extra_hosts:
-      - host.docker.internal:host-gateway
+    networks: [ default, signal ]
 
   myapp-signal-register:
     image: curlimages/curl
     restart: on-failure
     depends_on: [ myapp ]
-    extra_hosts:
-      - host.docker.internal:host-gateway
+    networks: [ signal ]
     environment:
       - ROUTER_TOKEN=<same value as signal-gateway/.env>
     command: >
@@ -170,13 +182,18 @@ services:
               -H "X-Token: $$ROUTER_TOKEN"
               -H "Content-Type: application/json"
               -d "{\"prefix\":\"myapp\",\"webhook\":\"http://myapp:1234/cmd\"}"
-              http://host.docker.internal:8091/register;
+              http://signal-gateway-router:8091/register;
             do sleep 5; done'
+
+networks:
+  default:
+  signal:
+    external: true
 ```
 
 `myapp`'s `/cmd` endpoint receives requests shaped like `POST {"message": "<text after the prefix>"}` and may return any text body — whatever it returns is sent back to you over Signal.
 
-If `myapp` is on a different docker network (reached via `host.docker.internal`), anyone on the host can hit `/cmd` and spoof commands. Add an `auth_header` to the registration so signal-gateway includes a shared secret on every call:
+Anything else attached to the `signal` network can hit `myapp:1234/cmd` directly and spoof commands. To pin the call to signal-gateway, register with an `auth_header` and have `myapp` reject any `/cmd` request whose `X-Webhook-Token` header doesn't match:
 
 ```yaml
     command: >
@@ -185,14 +202,12 @@ If `myapp` is on a different docker network (reached via `host.docker.internal`)
               -H "Content-Type: application/json"
               -d "{
                 \"prefix\":\"myapp\",
-                \"webhook\":\"http://host.docker.internal:1234/cmd\",
+                \"webhook\":\"http://myapp:1234/cmd\",
                 \"auth_header\":{\"name\":\"X-Webhook-Token\",\"value\":\"$$WEBHOOK_TOKEN\"}
               }"
-              http://host.docker.internal:8091/register;
+              http://signal-gateway-router:8091/register;
             do sleep 5; done'
 ```
-
-`myapp` should then reject any `/cmd` request whose `X-Webhook-Token` header doesn't match.
 
 ## API reference
 
@@ -212,7 +227,7 @@ If `myapp` is on a different docker network (reached via `host.docker.internal`)
 | GET    | /routes             | `X-Token: $ROUTER_TOKEN` | — (returns current registrations; `has_auth_header` only, never the secret)                       |
 | GET    | /health             | —                        | —                                                                                                 |
 
-If `auth_header` is supplied in `/register`, the router sends that header on every webhook POST. Use it whenever the target webhook is reachable by other containers on the host (anything with `host.docker.internal` access) and you want the receiving app to verify the call came from signal-gateway.
+If `auth_header` is supplied in `/register`, the router sends that header on every webhook POST. Use it when other containers share the `signal` network and could otherwise reach the webhook directly — the receiving app verifies the header to confirm the call came through signal-gateway.
 
 ### signal-api — `127.0.0.1:8080`
 
@@ -221,7 +236,7 @@ Raw [bbernhard/signal-cli-rest-api](https://bbernhard.github.io/signal-cli-rest-
 ## Security model
 
 - All ports bind to `127.0.0.1` only. The gateway is **not** reachable from the LAN.
-- `NOTIFY_TOKEN` and `ROUTER_TOKEN` are separate secrets that gate the helper endpoints from any other process on the host (including containers that have `host.docker.internal` access — which is most of them).
+- `NOTIFY_TOKEN` and `ROUTER_TOKEN` are separate secrets that gate the helper endpoints from any other process that can reach them — anything on the shared `signal` network, or anything on the host that can dial `127.0.0.1:8090` / `127.0.0.1:8091`.
 - `signal-api` on `:8080` is **unauthenticated**. Anything that can reach `127.0.0.1:8080` can send Signal messages as you and read your Note-to-Self traffic. Treat it as a privileged host-local interface.
 - The blast radius of a leaked token is "spam yourself on Signal" — not external exposure.
 

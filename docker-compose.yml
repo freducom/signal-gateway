@@ -29,6 +29,7 @@ services:
       - "127.0.0.1:8090:8090"
     networks:
       - internal
+      - signal
 
   router:
     image: ghcr.io/freducom/signal-gateway-router:latest
@@ -48,7 +49,14 @@ services:
       - ./data/router:/data
     networks:
       - internal
+      - signal
 
 networks:
   internal:
+    driver: bridge
+  # Shared bridge that other compose projects join as external.
+  # They reach the gateway via service hostnames signal-gateway-notify:8090
+  # and signal-gateway-router:8091 — no host port / host-gateway needed.
+  signal:
+    name: signal
     driver: bridge
