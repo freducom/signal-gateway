@@ -1,0 +1,54 @@
+# signal-gateway — copy this file plus .env and run `docker compose up -d`.
+# Setup steps are in README.md.
+
+services:
+  signal-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: signal-gateway-api
+    restart: unless-stopped
+    environment:
+      - MODE=json-rpc
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data/signal-cli:/home/.local/share/signal-cli
+    networks:
+      - internal
+
+  notify:
+    image: ghcr.io/freducom/signal-gateway-notify:latest
+    container_name: signal-gateway-notify
+    restart: unless-stopped
+    depends_on:
+      - signal-api
+    environment:
+      - SIGNAL_API_URL=http://signal-api:8080
+      - SIGNAL_NUMBER=${SIGNAL_NUMBER}
+      - NOTIFY_TOKEN=${NOTIFY_TOKEN}
+    ports:
+      - "127.0.0.1:8090:8090"
+    networks:
+      - internal
+
+  router:
+    image: ghcr.io/freducom/signal-gateway-router:latest
+    container_name: signal-gateway-router
+    restart: unless-stopped
+    depends_on:
+      - signal-api
+    environment:
+      - SIGNAL_API_URL=http://signal-api:8080
+      - SIGNAL_API_WS_URL=ws://signal-api:8080
+      - SIGNAL_NUMBER=${SIGNAL_NUMBER}
+      - ROUTER_TOKEN=${ROUTER_TOKEN}
+      - DEVICE_NAME=signal-gateway
+    ports:
+      - "127.0.0.1:8091:8091"
+    volumes:
+      - ./data/router:/data
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge

@@ -1,0 +1,15 @@
+# Local-development override: rebuilds notify and router from source instead
+# of pulling the published images. Maintainers only — end users should use
+# docker-compose.yml as-is.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+
+services:
+  notify:
+    build: ./notify
+    image: signal-gateway-notify:dev
+
+  router:
+    build: ./router
+    image: signal-gateway-router:dev
