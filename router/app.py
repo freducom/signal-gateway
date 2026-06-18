@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import os
 import threading
@@ -17,29 +18,44 @@ DEVICE_NAME = os.environ.get("DEVICE_NAME", "signal-gateway")
 ROUTES_PATH = Path("/data/routes.json")
 ROUTES_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+DEFAULT_TIMEOUT_SECONDS = 30
+MAX_TIMEOUT_SECONDS = 600
+
 routes_lock = threading.Lock()
-# Each route: {"webhook": str, "auth_header": {"name": str, "value": str} | None}
+# Each route: {"webhook": str, "auth_header": {name, value} | None, "timeout_seconds": int}
 routes: dict[str, dict] = {}
 own_device_id: int | None = None
+
+# Webhook dispatch runs in a thread pool so a slow handler doesn't block
+# the websocket receive loop.
+_dispatcher = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="dispatch")
 
 app = Flask(__name__)
 
 
 def load_routes():
     global routes
-    if ROUTES_PATH.exists():
-        try:
-            with ROUTES_PATH.open() as f:
-                raw = json.load(f)
-            # Back-compat: older routes.json stored bare URL strings.
-            routes = {
-                k: ({"webhook": v, "auth_header": None} if isinstance(v, str) else v)
-                for k, v in raw.items()
-            }
-        except json.JSONDecodeError:
-            routes = {}
-    else:
+    if not ROUTES_PATH.exists():
         routes = {}
+        return
+    try:
+        with ROUTES_PATH.open() as f:
+            raw = json.load(f)
+    except json.JSONDecodeError:
+        routes = {}
+        return
+    out: dict[str, dict] = {}
+    for prefix, value in raw.items():
+        if isinstance(value, str):
+            # Oldest format: bare URL string.
+            out[prefix] = {"webhook": value, "auth_header": None, "timeout_seconds": DEFAULT_TIMEOUT_SECONDS}
+        else:
+            out[prefix] = {
+                "webhook": value["webhook"],
+                "auth_header": value.get("auth_header"),
+                "timeout_seconds": value.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            }
+    routes = out
 
 
 def save_routes():
@@ -67,6 +83,7 @@ def register():
     prefix = (body.get("prefix") or "").strip().lower()
     webhook = (body.get("webhook") or "").strip()
     auth_header = body.get("auth_header")
+    raw_timeout = body.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
     if not prefix or not webhook:
         abort(400, "prefix and webhook required")
     if auth_header is not None:
@@ -76,10 +93,26 @@ def register():
             or not auth_header.get("value")
         ):
             abort(400, "auth_header must be an object with 'name' and 'value'")
+    try:
+        timeout_seconds = int(raw_timeout)
+    except (TypeError, ValueError):
+        abort(400, "timeout_seconds must be an integer")
+    if not 1 <= timeout_seconds <= MAX_TIMEOUT_SECONDS:
+        abort(400, f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}")
     with routes_lock:
-        routes[prefix] = {"webhook": webhook, "auth_header": auth_header}
+        routes[prefix] = {
+            "webhook": webhook,
+            "auth_header": auth_header,
+            "timeout_seconds": timeout_seconds,
+        }
         save_routes()
-    return jsonify(ok=True, prefix=prefix, webhook=webhook, auth_header=bool(auth_header))
+    return jsonify(
+        ok=True,
+        prefix=prefix,
+        webhook=webhook,
+        auth_header=bool(auth_header),
+        timeout_seconds=timeout_seconds,
+    )
 
 
 @app.delete("/register/<prefix>")
@@ -99,6 +132,7 @@ def list_routes():
             prefix: {
                 "webhook": route["webhook"],
                 "has_auth_header": route.get("auth_header") is not None,
+                "timeout_seconds": route.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
             }
             for prefix, route in routes.items()
         })
@@ -167,9 +201,14 @@ def handle_envelope(raw: dict):
 
     with routes_lock:
         route = routes.get(prefix)
+        available = sorted(routes.keys())
 
     if not route:
-        send_reply(f"no handler for prefix '{prefix}'")
+        if available:
+            listing = ", ".join(available)
+            send_reply(f"no handler for prefix '{prefix}'. registered: {listing}")
+        else:
+            send_reply(f"no handler for prefix '{prefix}'. no handlers registered.")
         return
 
     headers = {}
@@ -177,8 +216,14 @@ def handle_envelope(raw: dict):
     if auth_header:
         headers[auth_header["name"]] = auth_header["value"]
 
+    timeout = route.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
     try:
-        r = requests.post(route["webhook"], json={"message": body}, headers=headers, timeout=30)
+        r = requests.post(
+            route["webhook"],
+            json={"message": body},
+            headers=headers,
+            timeout=timeout,
+        )
         reply = r.text.strip() or f"({r.status_code} no body)"
     except requests.RequestException as e:
         reply = f"webhook error: {e}"
@@ -202,7 +247,9 @@ def ws_loop():
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                handle_envelope(msg)
+                # Dispatch in the thread pool so a slow webhook never blocks
+                # subsequent incoming messages.
+                _dispatcher.submit(handle_envelope, msg)
         except Exception as e:
             print(f"[router] ws error: {e}", flush=True)
         time.sleep(5)

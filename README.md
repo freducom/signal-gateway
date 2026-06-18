@@ -222,12 +222,14 @@ Anything else attached to the `signal` network can hit `myapp:1234/cmd` directly
 
 | Method | Path                | Auth                     | Body                                                                                              |
 |--------|---------------------|--------------------------|---------------------------------------------------------------------------------------------------|
-| POST   | /register           | `X-Token: $ROUTER_TOKEN` | `{"prefix": "...", "webhook": "...", "auth_header": {"name": "...", "value": "..."}}` (auth optional) |
+| POST   | /register           | `X-Token: $ROUTER_TOKEN` | `{"prefix": "...", "webhook": "...", "auth_header": {...}, "timeout_seconds": 30}` (auth + timeout optional) |
 | DELETE | /register/{prefix}  | `X-Token: $ROUTER_TOKEN` | —                                                                                                 |
-| GET    | /routes             | `X-Token: $ROUTER_TOKEN` | — (returns current registrations; `has_auth_header` only, never the secret)                       |
+| GET    | /routes             | `X-Token: $ROUTER_TOKEN` | — (returns `webhook`, `has_auth_header`, `timeout_seconds`)                                       |
 | GET    | /health             | —                        | —                                                                                                 |
 
 If `auth_header` is supplied in `/register`, the router sends that header on every webhook POST. Use it when other containers share the `signal` network and could otherwise reach the webhook directly — the receiving app verifies the header to confirm the call came through signal-gateway.
+
+`timeout_seconds` is how long the router waits for the webhook to reply before giving up (default 30, max 600). LLM-backed handlers should register with a generous value — 300 s is a reasonable starting point. Webhook dispatch runs in a thread pool, so a slow handler does not block other prefixes.
 
 ### signal-api — `127.0.0.1:8080`
 
