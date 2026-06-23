@@ -231,6 +231,8 @@ If `auth_header` is supplied in `/register`, the router sends that header on eve
 
 `timeout_seconds` is how long the router waits for the webhook to reply before giving up (default 30, max 600). LLM-backed handlers should register with a generous value — 300 s is a reasonable starting point. Webhook dispatch runs in a thread pool, so a slow handler does not block other prefixes.
 
+**Convention: handlers self-document.** Every webhook should respond to an empty message body (the user typed just the prefix, e.g. `bv` alone) with a plain-text listing of its commands / subcommands / features. Don't return 200 empty in that case — the router will substitute `ok` and the user is left guessing. The listing is the handler's contract with the user; only the handler knows what it supports.
+
 ### signal-api — `127.0.0.1:8080`
 
 Raw [bbernhard/signal-cli-rest-api](https://bbernhard.github.io/signal-cli-rest-api/). Used for the QR link flow and any advanced operations. **No authentication** — see Security below.
@@ -248,6 +250,7 @@ Raw [bbernhard/signal-cli-rest-api](https://bbernhard.github.io/signal-cli-rest-
 - **Outbound messages never arrive.** Check `docker compose logs signal-api`. First-time send after a restart can take a few seconds while the json-rpc loop reconnects.
 - **Router doesn't reply to messages I type on my phone.** Check `docker compose logs router`. Common causes: webhook target container is down, route was registered with a stale URL, signal-api websocket dropped.
 - **Router replied to a message the gateway itself sent.** Should not happen — the router filters `sourceDevice == own device`. If you see it, restart `router` so it re-queries its own device id from signal-api.
+- **My handler just returned 200 with no body — what does the user see?** The router replies `ok`. Non-2xx with no body surfaces as `({status} no body)`. Return a non-empty body if you want a richer reply.
 
 ## Development
 

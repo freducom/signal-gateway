@@ -20,9 +20,11 @@ ROUTES_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 600
+MAX_DESCRIPTION_LEN = 200
 
 routes_lock = threading.Lock()
-# Each route: {"webhook": str, "auth_header": {name, value} | None, "timeout_seconds": int}
+# Each route: {"webhook": str, "auth_header": {name, value} | None,
+#              "timeout_seconds": int, "description": str}
 routes: dict[str, dict] = {}
 own_device_id: int | None = None
 
@@ -48,12 +50,18 @@ def load_routes():
     for prefix, value in raw.items():
         if isinstance(value, str):
             # Oldest format: bare URL string.
-            out[prefix] = {"webhook": value, "auth_header": None, "timeout_seconds": DEFAULT_TIMEOUT_SECONDS}
+            out[prefix] = {
+                "webhook": value,
+                "auth_header": None,
+                "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+                "description": "",
+            }
         else:
             out[prefix] = {
                 "webhook": value["webhook"],
                 "auth_header": value.get("auth_header"),
                 "timeout_seconds": value.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+                "description": value.get("description", "") or "",
             }
     routes = out
 
@@ -84,6 +92,7 @@ def register():
     webhook = (body.get("webhook") or "").strip()
     auth_header = body.get("auth_header")
     raw_timeout = body.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    description = (body.get("description") or "").strip()
     if not prefix or not webhook:
         abort(400, "prefix and webhook required")
     if auth_header is not None:
@@ -99,11 +108,14 @@ def register():
         abort(400, "timeout_seconds must be an integer")
     if not 1 <= timeout_seconds <= MAX_TIMEOUT_SECONDS:
         abort(400, f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}")
+    if len(description) > MAX_DESCRIPTION_LEN:
+        abort(400, f"description must be at most {MAX_DESCRIPTION_LEN} chars")
     with routes_lock:
         routes[prefix] = {
             "webhook": webhook,
             "auth_header": auth_header,
             "timeout_seconds": timeout_seconds,
+            "description": description,
         }
         save_routes()
     return jsonify(
@@ -112,6 +124,7 @@ def register():
         webhook=webhook,
         auth_header=bool(auth_header),
         timeout_seconds=timeout_seconds,
+        description=description,
     )
 
 
@@ -133,6 +146,7 @@ def list_routes():
                 "webhook": route["webhook"],
                 "has_auth_header": route.get("auth_header") is not None,
                 "timeout_seconds": route.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+                "description": route.get("description", ""),
             }
             for prefix, route in routes.items()
         })
@@ -201,12 +215,20 @@ def handle_envelope(raw: dict):
 
     with routes_lock:
         route = routes.get(prefix)
-        available = sorted(routes.keys())
+        available = sorted(
+            (p, r.get("description", "")) for p, r in routes.items()
+        )
 
     if not route:
         if available:
-            listing = ", ".join(available)
-            send_reply(f"no handler for prefix '{prefix}'. registered: {listing}")
+            lines = [
+                f"  {p} — {desc}" if desc else f"  {p}"
+                for p, desc in available
+            ]
+            send_reply(
+                f"no handler for prefix '{prefix}'. registered:\n"
+                + "\n".join(lines)
+            )
         else:
             send_reply(f"no handler for prefix '{prefix}'. no handlers registered.")
         return
@@ -224,7 +246,9 @@ def handle_envelope(raw: dict):
             headers=headers,
             timeout=timeout,
         )
-        reply = r.text.strip() or f"({r.status_code} no body)"
+        reply = r.text.strip()
+        if not reply:
+            reply = "ok" if r.ok else f"({r.status_code} no body)"
     except requests.RequestException as e:
         reply = f"webhook error: {e}"
 
